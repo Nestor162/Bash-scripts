@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==========================================
-#  SOLIDTIME CLI v9.0 (Dictionary Fix)
+#  SOLIDTIME CLI v10.0 (Clean UI & Hidden IDs)
 # ==========================================
 
 API_URL="https://app.solidtime.io/api/v1"
 TOKEN="TU_API_KEY_AQUI"
 CACHE_FILE="/tmp/solidtime_creds"
 
-# Colores
+# Paleta de Colores (Diseño Elegante)
 BOLD=$(tput bold)
 DIM=$(tput dim)
 GREEN=$(tput setaf 2)
@@ -16,6 +16,7 @@ RED=$(tput setaf 1)
 BLUE=$(tput setaf 4)
 CYAN=$(tput setaf 6)
 MAGENTA=$(tput setaf 5)
+WHITE=$(tput setaf 7)
 RESET=$(tput sgr0)
 
 # --- FUNCIONES INTERNAS ---
@@ -73,19 +74,17 @@ format_duration_human() {
     printf "%dh %02dm" $((sec/3600)) $((sec%3600/60))
 }
 
-# --- LOGICA DEL LOG (DICCIONARIO) ---
+# --- LOG (REPORTE) ---
 log_day() {
     get_ids
     today_start=$(date -u +"%Y-%m-%dT00:00:00Z")
     today_end=$(date -u +"%Y-%m-%dT23:59:59Z")
 
-    echo "🔄 Sincronizando proyectos..."
+    echo "🔄 Sincronizando..."
     
-    # 1. CREAR DICCIONARIO DE PROYECTOS (ID -> NOMBRE)
+    # Mapa de Proyectos
     declare -A PROJECT_MAP
     projects_raw=$(call_api "GET" "/organizations/$ORG_ID/projects")
-    
-    # Llenamos el array asociativo
     while IFS="|" read -r pid pname; do
         PROJECT_MAP["$pid"]="$pname"
     done < <(echo "$projects_raw" | jq -r '.data[] | "\(.id)|\(.name)"')
@@ -103,50 +102,34 @@ log_day() {
     count=$(echo "$response" | jq '.data | length')
     if [ "$count" -eq 0 ]; then echo "😴 Nada por aquí hoy."; exit 0; fi
 
-    # Archivo temporal para guardar los subtotales calculados en el loop
     tmp_subtotals="/tmp/solid_subtotals"
     > "$tmp_subtotals"
 
-    # Procesamos entradas
     echo "$response" | jq -r '.data[] | "\(.start)|\(.end)|\(.duration//0)|\(.project_id)|\(.description // "")"' | 
     while IFS="|" read -r start_utc end_utc dur pid desc; do
-        
-        # BUSCAR NOMBRE EN DICCIONARIO
         p_name="${PROJECT_MAP[$pid]}"
         if [ -z "$p_name" ] || [ "$p_name" == "null" ]; then p_name="Desconocido"; fi
 
-        # Guardar para subtotal (Nombre|Segundos)
-        if [ "$end_utc" != "null" ]; then
-            echo "$p_name|$dur" >> "$tmp_subtotals"
-        fi
+        if [ "$end_utc" != "null" ]; then echo "$p_name|$dur" >> "$tmp_subtotals"; fi
 
-        # Visualización
         start_local=$(date -d "$start_utc" +"%H:%M" 2>/dev/null)
-        
         if [ "$end_utc" == "null" ]; then
-            dur_txt="${GREEN}▶ ACTIVO${RESET}"
-            icon="⚡"
-            # También sumamos al archivo temp para que aparezca en la lista de proyectos
+            dur_txt="${GREEN}▶ ACTIVO${RESET}"; icon="⚡"
             echo "$p_name|0" >> "$tmp_subtotals"
         else
-            dur_txt=$(format_duration_human "$dur")
-            icon="●"
+            dur_txt=$(format_duration_human "$dur"); icon="●"
         fi
-        
         if [ ${#desc} -gt 40 ]; then desc="${desc:0:39}…"; fi
 
         echo "${CYAN}$start_local${RESET} $icon ${BOLD}$dur_txt${RESET}"
         echo "  ${BLUE}📂 $p_name${RESET}"
         echo "  ${DIM}📝 $desc${RESET}"
         echo "" 
-
     done
 
-    # IMPRIMIR SUBTOTALES (Usando awk sobre el archivo temporal)
     if [ -s "$tmp_subtotals" ]; then
         echo "${DIM}── RESUMEN POR PROYECTO ────────${RESET}"
-        awk -F"|" '{a[$1]+=$2} END {for (i in a) print i"|"a[i]}' "$tmp_subtotals" | \
-        sort | \
+        awk -F"|" '{a[$1]+=$2} END {for (i in a) print i"|"a[i]}' "$tmp_subtotals" | sort | \
         while IFS="|" read -r name seconds; do
             fmt=$(printf "%dh %02dm" $((seconds/3600)) $((seconds%3600/60)))
             echo -e "${MAGENTA}■${RESET} $name: ${BOLD}$fmt${RESET}"
@@ -162,7 +145,6 @@ exit_menu() {
     echo "${BOLD}🛑 PAUSA${RESET}"
     echo "[Enter] Guardar  |  [d] Borrar  |  [c] Seguir"
     read -n 1 -s choice
-
     case "$choice" in
         d|D)
             echo -e "\n${RED}🗑️ Eliminado.${RESET}"
@@ -177,40 +159,94 @@ exit_menu() {
     esac
 }
 
-# --- DASHBOARD ---
+# --- DASHBOARD DE INICIO (NUEVO DISEÑO) ---
 start_timer() {
     get_ids
-    # Selección rápida
-    clear; echo "🔄 Cargando..."
+    clear
+    echo "🔄 Conectando..."
+    
+    # 1. CARGAR PROYECTOS EN ARRAYS (OCULTAR IDs)
     projects_json=$(call_api "GET" "/organizations/$ORG_ID/projects")
-    echo "${BOLD}📂 PROYECTOS:${RESET}"
-    echo "$projects_json" | jq -r '.data[] | "\(.id) \(.name)"' | nl -w2 -s") "
-    read -p "> " p_num
     
-    if ! [[ "$p_num" =~ ^[0-9]+$ ]]; then echo "❌ Número inválido"; exit 1; fi
-
-    p_id=$(echo "$projects_json" | jq -r ".data[$((p_num-1))].id")
-    p_name=$(echo "$projects_json" | jq -r ".data[$((p_num-1))].name")
+    # Arrays para guardar datos
+    p_ids=()
+    p_names=()
     
-    # Tareas
-    clear; echo "🔄 Tareas en $p_name..."
-    tasks=$(call_api "GET" "/organizations/$ORG_ID/tasks?project_id=$p_id")
-    t_count=$(echo "$tasks" | jq '.data | length')
+    # Leer JSON linea por linea y llenar arrays
+    while IFS="|" read -r pid pname; do
+        p_ids+=("$pid")
+        p_names+=("$pname")
+    done < <(echo "$projects_json" | jq -r '.data[] | "\(.id)|\(.name)"')
+    
+    # MOSTRAR LISTA LIMPIA
+    clear
+    echo "${BOLD}📂 SELECCIONA UN PROYECTO:${RESET}"
+    echo "${DIM}────────────────────────────────${RESET}"
+    
+    # Loop para imprimir bonito
+    i=0
+    for name in "${p_names[@]}"; do
+        index=$((i+1))
+        # Formato: 1. Nombre (Color Blanco)
+        echo " ${BLUE}${BOLD}$index.${RESET} $name"
+        ((i++))
+    done
+    echo ""
+    read -p "${BOLD}> Número: ${RESET}" p_choice
+    
+    # Validar y recuperar ID oculto
+    if ! [[ "$p_choice" =~ ^[0-9]+$ ]] || [ "$p_choice" -lt 1 ] || [ "$p_choice" -gt "${#p_ids[@]}" ]; then
+        echo "❌ Opción inválida"; exit 1
+    fi
+    
+    # Array start at 0, option at 1
+    idx=$((p_choice-1))
+    p_id="${p_ids[$idx]}"
+    p_name="${p_names[$idx]}"
+    
+    # 2. CARGAR TAREAS (MISMA LÓGICA)
+    clear
+    echo "🔄 Buscando tareas en $p_name..."
+    tasks_json=$(call_api "GET" "/organizations/$ORG_ID/tasks?project_id=$p_id")
+    t_count=$(echo "$tasks_json" | jq '.data | length')
+    
     t_id="null"
+    
     if [ "$t_count" -gt 0 ]; then
-        echo "${BOLD}📋 TAREAS:${RESET}"
-        echo "$tasks" | jq -r '.data[] | "\(.id) \(.name)"' | nl -w2 -s") "
-        read -p "> (Enter=Ninguna) " t_num
-        if [ -n "$t_num" ]; then
-             t_id=$(echo "$tasks" | jq -r ".data[$((t_num-1))].id")
+        t_ids=()
+        t_names=()
+        
+        while IFS="|" read -r tid tname; do
+            t_ids+=("$tid")
+            t_names+=("$tname")
+        done < <(echo "$tasks_json" | jq -r '.data[] | "\(.id)|\(.name)"')
+        
+        clear
+        echo "${BOLD}📋 TAREAS EN: ${BLUE}$p_name${RESET}"
+        echo "${DIM}────────────────────────────────${RESET}"
+        
+        j=0
+        for name in "${t_names[@]}"; do
+            index=$((j+1))
+            echo " ${CYAN}${BOLD}$index.${RESET} $name"
+            ((j++))
+        done
+        echo ""
+        read -p "${BOLD}> Número (Enter = Ninguna): ${RESET}" t_choice
+        
+        if [ -n "$t_choice" ] && [[ "$t_choice" =~ ^[0-9]+$ ]] && [ "$t_choice" -ge 1 ] && [ "$t_choice" -le "${#t_ids[@]}" ]; then
+            t_idx=$((t_choice-1))
+            t_id="${t_ids[$t_idx]}"
         fi
     fi
 
+    # 3. INPUT FINAL
     clear
-    echo "Proyecto: ${BLUE}$p_name${RESET}"
-    read -p "📝 Qué haces?: " desc
-    if [ -z "$desc" ]; then desc="Focus"; fi
+    echo "${DIM}Proyecto:${RESET} ${BLUE}$p_name${RESET}"
+    read -p "${BOLD}📝 Descripción:${RESET} " desc
+    if [ -z "$desc" ]; then desc="Focus Time"; fi
 
+    # INICIO TIMER
     start_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
     json="{\"member_id\": \"$MEMBER_ID\", \"project_id\": \"$p_id\", \"description\": \"$desc\", \"start\": \"$start_iso\", \"billable\": false}"
@@ -221,8 +257,9 @@ start_timer() {
     resp=$(call_api "POST" "/organizations/$ORG_ID/time-entries" "$json")
     CURRENT_ENTRY_ID=$(echo "$resp" | jq -r '.data.id')
     
-    if [ "$CURRENT_ENTRY_ID" == "null" ]; then echo "❌ Error"; exit 1; fi
+    if [ "$CURRENT_ENTRY_ID" == "null" ]; then echo "❌ Error al iniciar"; exit 1; fi
 
+    # --- LOOP DASHBOARD ---
     start_sec=$(date +%s)
     tput civis
     trap 'exit_menu' SIGINT
