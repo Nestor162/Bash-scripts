@@ -1,0 +1,258 @@
+#!/bin/bash
+
+# ==========================================
+#  SOLIDTIME CLI v9.0 (Dictionary Fix)
+# ==========================================
+
+API_URL="https://app.solidtime.io/api/v1"
+TOKEN="TU_API_KEY_AQUI"
+CACHE_FILE="/tmp/solidtime_creds"
+
+# Colores
+BOLD=$(tput bold)
+DIM=$(tput dim)
+GREEN=$(tput setaf 2)
+RED=$(tput setaf 1)
+BLUE=$(tput setaf 4)
+CYAN=$(tput setaf 6)
+MAGENTA=$(tput setaf 5)
+RESET=$(tput sgr0)
+
+# --- FUNCIONES INTERNAS ---
+
+call_api() {
+    local method=$1
+    local endpoint=$2
+    local data=$3
+    
+    if [ -z "$data" ]; then
+        curl -sS -X "$method" "$API_URL$endpoint" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json"
+    else
+        curl -sS -X "$method" "$API_URL$endpoint" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "$data"
+    fi
+}
+
+get_ids() {
+    if [ -f "$CACHE_FILE" ]; then
+        IFS=":" read -r saved_org saved_member < "$CACHE_FILE"
+        if [ -n "$saved_org" ] && [ -n "$saved_member" ]; then
+            ORG_ID=$saved_org
+            MEMBER_ID=$saved_member
+            return
+        fi
+    fi
+    response=$(call_api "GET" "/users/me/memberships")
+    org_id_val=$(echo "$response" | jq -r '.data[0].organization.id')
+    member_id_val=$(echo "$response" | jq -r '.data[0].id')
+    
+    if [ "$org_id_val" == "null" ] || [ -z "$member_id_val" ]; then
+        echo "❌ Error de credenciales." >&2
+        rm -f "$CACHE_FILE"
+        exit 1
+    fi
+    echo "$org_id_val:$member_id_val" > "$CACHE_FILE"
+    ORG_ID=$org_id_val
+    MEMBER_ID=$member_id_val
+}
+
+format_time() {
+    local total_seconds=$1
+    printf "%02d:%02d:%02d" $((total_seconds/3600)) $((total_seconds%3600/60)) $((total_seconds%60))
+}
+
+format_duration_human() {
+    local sec=$1
+    if [ -z "$sec" ] || [ "$sec" == "null" ]; then echo "--"; return; fi
+    printf "%dh %02dm" $((sec/3600)) $((sec%3600/60))
+}
+
+# --- LOGICA DEL LOG (DICCIONARIO) ---
+log_day() {
+    get_ids
+    today_start=$(date -u +"%Y-%m-%dT00:00:00Z")
+    today_end=$(date -u +"%Y-%m-%dT23:59:59Z")
+
+    echo "🔄 Sincronizando proyectos..."
+    
+    # 1. CREAR DICCIONARIO DE PROYECTOS (ID -> NOMBRE)
+    declare -A PROJECT_MAP
+    projects_raw=$(call_api "GET" "/organizations/$ORG_ID/projects")
+    
+    # Llenamos el array asociativo
+    while IFS="|" read -r pid pname; do
+        PROJECT_MAP["$pid"]="$pname"
+    done < <(echo "$projects_raw" | jq -r '.data[] | "\(.id)|\(.name)"')
+
+    echo "🔄 Cargando tiempos..."
+    response=$(call_api "GET" "/organizations/$ORG_ID/time-entries?start=${today_start}&end=${today_end}&per_page=100")
+    
+    total_day_sec=$(echo "$response" | jq '[.data[].duration // 0] | add')
+    total_day_fmt=$(format_duration_human "$total_day_sec")
+    
+    clear
+    echo "${BOLD}📅 HOY $(date +"%d/%m")${RESET}  |  Total: ${GREEN}${BOLD}$total_day_fmt${RESET}"
+    echo "${DIM}──────────────────────────────────${RESET}"
+
+    count=$(echo "$response" | jq '.data | length')
+    if [ "$count" -eq 0 ]; then echo "😴 Nada por aquí hoy."; exit 0; fi
+
+    # Archivo temporal para guardar los subtotales calculados en el loop
+    tmp_subtotals="/tmp/solid_subtotals"
+    > "$tmp_subtotals"
+
+    # Procesamos entradas
+    echo "$response" | jq -r '.data[] | "\(.start)|\(.end)|\(.duration//0)|\(.project_id)|\(.description // "")"' | 
+    while IFS="|" read -r start_utc end_utc dur pid desc; do
+        
+        # BUSCAR NOMBRE EN DICCIONARIO
+        p_name="${PROJECT_MAP[$pid]}"
+        if [ -z "$p_name" ] || [ "$p_name" == "null" ]; then p_name="Desconocido"; fi
+
+        # Guardar para subtotal (Nombre|Segundos)
+        if [ "$end_utc" != "null" ]; then
+            echo "$p_name|$dur" >> "$tmp_subtotals"
+        fi
+
+        # Visualización
+        start_local=$(date -d "$start_utc" +"%H:%M" 2>/dev/null)
+        
+        if [ "$end_utc" == "null" ]; then
+            dur_txt="${GREEN}▶ ACTIVO${RESET}"
+            icon="⚡"
+            # También sumamos al archivo temp para que aparezca en la lista de proyectos
+            echo "$p_name|0" >> "$tmp_subtotals"
+        else
+            dur_txt=$(format_duration_human "$dur")
+            icon="●"
+        fi
+        
+        if [ ${#desc} -gt 40 ]; then desc="${desc:0:39}…"; fi
+
+        echo "${CYAN}$start_local${RESET} $icon ${BOLD}$dur_txt${RESET}"
+        echo "  ${BLUE}📂 $p_name${RESET}"
+        echo "  ${DIM}📝 $desc${RESET}"
+        echo "" 
+
+    done
+
+    # IMPRIMIR SUBTOTALES (Usando awk sobre el archivo temporal)
+    if [ -s "$tmp_subtotals" ]; then
+        echo "${DIM}── RESUMEN POR PROYECTO ────────${RESET}"
+        awk -F"|" '{a[$1]+=$2} END {for (i in a) print i"|"a[i]}' "$tmp_subtotals" | \
+        sort | \
+        while IFS="|" read -r name seconds; do
+            fmt=$(printf "%dh %02dm" $((seconds/3600)) $((seconds%3600/60)))
+            echo -e "${MAGENTA}■${RESET} $name: ${BOLD}$fmt${RESET}"
+        done
+        echo ""
+    fi
+}
+
+# --- MENÚ SALIDA ---
+exit_menu() {
+    tput cnorm
+    echo ""
+    echo "${BOLD}🛑 PAUSA${RESET}"
+    echo "[Enter] Guardar  |  [d] Borrar  |  [c] Seguir"
+    read -n 1 -s choice
+
+    case "$choice" in
+        d|D)
+            echo -e "\n${RED}🗑️ Eliminado.${RESET}"
+            call_api "DELETE" "/organizations/$ORG_ID/time-entries/$CURRENT_ENTRY_ID" > /dev/null
+            exit 0 ;;
+        c|C) return ;;
+        *)
+            echo -e "\n${GREEN}💾 Guardado.${RESET}"
+            end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            call_api "PUT" "/organizations/$ORG_ID/time-entries/$CURRENT_ENTRY_ID" "{\"end\": \"$end_time\"}" > /dev/null
+            exit 0 ;;
+    esac
+}
+
+# --- DASHBOARD ---
+start_timer() {
+    get_ids
+    # Selección rápida
+    clear; echo "🔄 Cargando..."
+    projects_json=$(call_api "GET" "/organizations/$ORG_ID/projects")
+    echo "${BOLD}📂 PROYECTOS:${RESET}"
+    echo "$projects_json" | jq -r '.data[] | "\(.id) \(.name)"' | nl -w2 -s") "
+    read -p "> " p_num
+    
+    if ! [[ "$p_num" =~ ^[0-9]+$ ]]; then echo "❌ Número inválido"; exit 1; fi
+
+    p_id=$(echo "$projects_json" | jq -r ".data[$((p_num-1))].id")
+    p_name=$(echo "$projects_json" | jq -r ".data[$((p_num-1))].name")
+    
+    # Tareas
+    clear; echo "🔄 Tareas en $p_name..."
+    tasks=$(call_api "GET" "/organizations/$ORG_ID/tasks?project_id=$p_id")
+    t_count=$(echo "$tasks" | jq '.data | length')
+    t_id="null"
+    if [ "$t_count" -gt 0 ]; then
+        echo "${BOLD}📋 TAREAS:${RESET}"
+        echo "$tasks" | jq -r '.data[] | "\(.id) \(.name)"' | nl -w2 -s") "
+        read -p "> (Enter=Ninguna) " t_num
+        if [ -n "$t_num" ]; then
+             t_id=$(echo "$tasks" | jq -r ".data[$((t_num-1))].id")
+        fi
+    fi
+
+    clear
+    echo "Proyecto: ${BLUE}$p_name${RESET}"
+    read -p "📝 Qué haces?: " desc
+    if [ -z "$desc" ]; then desc="Focus"; fi
+
+    start_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    json="{\"member_id\": \"$MEMBER_ID\", \"project_id\": \"$p_id\", \"description\": \"$desc\", \"start\": \"$start_iso\", \"billable\": false}"
+    if [ "$t_id" != "null" ]; then
+        json=$(echo "$json" | jq --arg tid "$t_id" '. + {task_id: $tid}')
+    fi
+
+    resp=$(call_api "POST" "/organizations/$ORG_ID/time-entries" "$json")
+    CURRENT_ENTRY_ID=$(echo "$resp" | jq -r '.data.id')
+    
+    if [ "$CURRENT_ENTRY_ID" == "null" ]; then echo "❌ Error"; exit 1; fi
+
+    start_sec=$(date +%s)
+    tput civis
+    trap 'exit_menu' SIGINT
+
+    while true; do
+        curr_sec=$(date +%s)
+        elapsed=$((curr_sec - start_sec))
+        cols=$(tput cols)
+        max_len=$((cols - 4))
+        if [ "$max_len" -lt 10 ]; then max_len=10; fi
+
+        p_show=${p_name:0:$max_len}
+        d_show=${desc:0:$max_len}
+
+        clear
+        echo ""
+        echo " ${GREEN}●${RESET} ${BOLD}FOCUS MODE${RESET}"
+        echo " ${DIM}────────────────${RESET}"
+        echo " ${BOLD}$(format_time $elapsed)${RESET}"
+        echo ""
+        echo " ${BLUE}📂 $p_show${RESET}"
+        echo " ${RESET}📝 $d_show${RESET}"
+        echo ""
+        echo " ${DIM}[Ctrl+C] Parar${RESET}"
+        sleep 1
+    done
+}
+
+case "$1" in
+    start) start_timer ;;
+    log) log_day ;;
+    *) echo "Uso: solid {start|log}" ;;
+esac
